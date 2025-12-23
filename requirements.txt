@@ -1,0 +1,8 @@
+numpy
+opencv-python
+torch
+torchvision
+ultralytics
+aiortc
+aiohttp
+av
