@@ -1,236 +1,289 @@
 import cv2
-import asyncio
-import queue
 import time
+import asyncio
+import threading
+import queue
+import requests
+import numpy as np
+
 from threading import Thread
+from ultralytics import YOLO
+
 from aiohttp import ClientSession
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.codecs import get_capabilities
 from av import VideoFrame
-from ultralytics import YOLO
-import numpy as np
 
 
-# ---------------------------------------------------------
-#  CONFIG (EDIT THESE)
-# ---------------------------------------------------------
+# =========================================================
+# CONFIG
+# =========================================================
 
-# WHIP_ENDPOINT_URL = "https://droneuse.com:8889/6620e41e2ca5b155a6dea465_ai/whip"  # <--- CHANGE THIS
-WHIP_ENDPOINT_URL = "http://0.0.0.0:8889/amar_ai/whip"  # <--- CHANGE THIS
+# MediaMTX Control API
+MEDIAMTX_API = "http://127.0.0.1:9997/v3/paths/list"
 
-RTSP_PIPELINE = (
-    "rtspsrc location=rtsp://0.0.0.0:8554/stream latency=0 ! "
-    "rtph264depay ! h264parse ! avdec_h264 ! "
-    "videoconvert ! video/x-raw,format=BGR ! appsink"
-)
+# MediaMTX RTSP base
+RTSP_BASE = "rtsp://127.0.0.1:8554"
 
-MODEL_PATH =YOLO("OCT_1_PER_VE_OBB.pt",task="obb")   # <--- CHANGE THIS
+# WHIP base (each stream will append /<name>_ai)
+WHIP_BASE = "http://127.0.0.1:8889"   # CHANGE THIS
 
-# CUSTOM CLASSES — NOT COCO!
-CUSTOM_CLASSES = ["person", "vehicle"]   # <--- PUT YOUR CLASSES HERE
+MODEL_PATH = "OCT_1_PER_VE_OBB.pt"
 
-CONF_THRESHOLD = 0.40
+CUSTOM_CLASSES = ["person", "vehicle"]
+CONF_THRESHOLD = 0.4
 
-NUM_WORKERS = 2   # number of PyTorch inference threads
+STREAM_SCAN_INTERVAL = 2.0   # seconds
 
-# ---------------------------------------------------------
-#  THREAD QUEUES
-# ---------------------------------------------------------
 
-frame_queue = queue.Queue(maxsize=4)
-result_queue = queue.Queue(maxsize=4)
+# =========================================================
+# MEDIA MTX DISCOVERY
+# =========================================================
 
-# ---------------------------------------------------------
-#  DETECTION WORKER (PyTorch)
-# ---------------------------------------------------------
+def get_active_paths():
+    """
+    Returns list of active MediaMTX paths that:
+    - are ready
+    - contain H264 video
+    """
+    try:
+        r = requests.get(MEDIAMTX_API, timeout=2)
+        items = r.json().get("items", [])
 
-class TorchOBBWorker(Thread):
-    def __init__(self, worker_id, model_path, custom_classes):
-        super().__init__(daemon=True)
-        self.worker_id = worker_id
-        self.model = YOLO(model_path, task="obb")
-        self.custom_classes = custom_classes
-        print(f"[Worker {worker_id}] OBB model loaded.")
+        paths = []
+        for it in items:
+            if it.get("ready") and "H264" in it.get("tracks", []):
+                if "_ai" in it["name"] or  it["ready"] == False:
+                    continue
+                paths.append(it["name"])
 
-    def run(self):
-        print(f"[Worker {self.worker_id}] Starting OBB detection loop...")
-        while True:
-            try:
-                frame, ts = frame_queue.get(timeout=1)
-            except queue.Empty:
+        return paths
+
+    except Exception as e:
+        print("[MediaMTX] API error:", e)
+        return []
+
+
+# =========================================================
+# PER-STREAM PIPELINE
+# =========================================================
+
+class StreamPipeline:
+    def __init__(self, name):
+        self.name = name
+        self.rtsp_url = f"{RTSP_BASE}/{name}"
+        self.whip_url = f"{WHIP_BASE}/{name}_ai/whip"
+
+        self.frame_q = queue.Queue(maxsize=4)
+        self.result_q = queue.Queue(maxsize=4)
+
+        self.model = YOLO(MODEL_PATH, task="obb")
+        self.running = True
+
+        print(f"[Pipeline] Starting for stream: {name}")
+
+        Thread(target=self.capture_loop, daemon=True).start()
+        Thread(target=self.infer_loop, daemon=True).start()
+        asyncio.create_task(self.start_whip())
+
+
+    # ---------------- CAPTURE ----------------
+
+    def capture_loop(self):
+        cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+
+        while self.running:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.05)
                 continue
 
             try:
-                results = self.model(frame, conf=CONF_THRESHOLD, verbose=True)
-                if results is None or len(results) == 0:
-                    continue
+                self.frame_q.put(frame, block=False)
+            except queue.Full:
+                pass
 
-                annotated = frame.copy()
+        cap.release()
+        print(f"[Capture] Stopped {self.name}")
 
-                for r in results:
-                    obb = r.obb
-                    if obb is None:
-                        continue
 
-                    xyxyxyxy_list = obb.xyxyxyxy   # [N, 8]
-                    cls_list = obb.cls
-                    conf_list = obb.conf
+    # ---------------- INFERENCE ----------------
 
-                    for i in range(len(cls_list)):
-                        cls = int(cls_list[i])
-                        conf = float(conf_list[i])
+    def infer_loop(self):
+        while self.running:
+            try:
+                frame = self.frame_q.get(timeout=1)
+            except queue.Empty:
+                continue
 
-                        # -------- FIX IS HERE --------
-                        pts = (
-                            xyxyxyxy_list[i]
-                            .reshape(4, 2)
-                            .cpu()
-                            .numpy()
-                            .astype(int)
-                        )
-                        # --------------------------------
+            annotated = frame.copy()
 
-                        cls_name = (
-                            self.custom_classes[cls]
-                            if cls < len(self.custom_classes)
-                            else f"class_{cls}"
-                        )
+            try:
+                results = self.model(
+                    frame,
+                    conf=CONF_THRESHOLD,
+                    device=0,
+                    half=True,
+                    verbose=False,
+                )
 
-                        # Draw box
-                        cv2.polylines(annotated, [pts], True, (0, 255, 255), 2)
+                if results:
+                    for r in results:
+                        if r.obb is None:
+                            continue
 
-                        # Draw label
-                        x_text, y_text = pts[0]
-                        cv2.putText(
-                            annotated,
-                            f"{cls_name} {conf:.2f}",
-                            (x_text, y_text - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (0, 255, 255),
-                            2,
-                        )
+                        for i in range(len(r.obb.cls)):
+                            pts = (
+                                r.obb.xyxyxyxy[i]
+                                .reshape(4, 2)
+                                .cpu()
+                                .numpy()
+                                .astype(int)
+                            )
+
+                            cls_id = int(r.obb.cls[i])
+                            conf = float(r.obb.conf[i])
+
+                            label = (
+                                CUSTOM_CLASSES[cls_id]
+                                if cls_id < len(CUSTOM_CLASSES)
+                                else f"class_{cls_id}"
+                            )
+
+                            cv2.polylines(
+                                annotated, [pts], True, (0, 255, 255), 2
+                            )
+                            cv2.putText(
+                                annotated,
+                                f"{label} {conf:.2f}",
+                                pts[0],
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6,
+                                (0, 255, 255),
+                                2,
+                            )
 
                 try:
-                    result_queue.put((annotated, ts), block=False)
+                    self.result_q.put(annotated, block=False)
                 except queue.Full:
                     pass
 
             except Exception as e:
-                print("[Worker Error]", e)
-                continue
+                print(f"[Infer:{self.name}]", e)
 
 
+    # ---------------- WHIP TRACK ----------------
 
-# ---------------------------------------------------------
-#  CAPTURE THREAD
-# ---------------------------------------------------------
+    class DetectionTrack(VideoStreamTrack):
+        def __init__(self, q):
+            super().__init__()
+            self.q = q
+            self.last = None
 
-def capture_loop():
-    # cap = cv2.VideoCapture(RTSP_PIPELINE, cv2.CAP_GSTREAMER)
-    
-    # cap = cv2.VideoCapture("rtsp://0.0.0.0:8554/6620e41e2ca5b155a6dea465")
-    cap = cv2.VideoCapture("rtsp://0.0.0.0:8554/amar")
-    if not cap.isOpened():
-        print("ERROR: Cannot open RTSP stream.")
-        return
+        async def recv(self):
+            pts, time_base = await self.next_timestamp()
 
-    print("[Capture] Started...")
+            try:
+                frame = self.q.get_nowait()
+                self.last = frame
+            except:
+                frame = self.last if self.last is not None else np.zeros(
+                    (480, 640, 3), dtype=np.uint8
+                )
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.01)
-            continue
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            vf = VideoFrame.from_ndarray(rgb, format="rgb24")
+            vf.pts = pts
+            vf.time_base = time_base
+            return vf
 
-        ts = time.time()
 
+    # ---------------- WHIP STREAM ----------------
+
+    async def start_whip(self):
+     while self.running:
         try:
-            frame_queue.put((frame.copy(), ts), block=False)
-        except queue.Full:
-            pass
+            pc = RTCPeerConnection()
+
+            # ---- Create video track ----
+            track = self.DetectionTrack(self.result_q)
+
+            # ---- Create ONE explicit video transceiver ----
+            transceiver = pc.addTransceiver(
+                "video",
+                direction="sendonly"
+            )
+
+            # ---- Force H264 only (MediaMTX requirement) ----
+            codecs = get_capabilities("video").codecs
+            h264 = [c for c in codecs if c.mimeType == "video/H264"]
+            transceiver.setCodecPreferences(h264)
+
+            # ---- Attach track to EXISTING sender (CRITICAL FIX) ----
+            transceiver.sender.replaceTrack(track)
+
+            # ---- Create offer ----
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+
+            async with ClientSession() as session:
+                async with session.post(
+                    self.whip_url,
+                    headers={"Content-Type": "application/sdp"},
+                    data=pc.localDescription.sdp,
+                ) as resp:
+                    answer_sdp = await resp.text()
+
+            # ---- Apply answer ----
+            await pc.setRemoteDescription(
+                RTCSessionDescription(answer_sdp, "answer")
+            )
+
+            print(f"[WHIP] Streaming started for {self.name}")
+
+            # ---- Keep alive ----
+            while self.running:
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            print(f"[WHIP:{self.name}] Error:", e)
+            print("[WHIP] Retrying in 5 seconds...")
+            await asyncio.sleep(5)
 
 
-# ---------------------------------------------------------
-#  WHIP VIDEO STREAM TRACK
-# ---------------------------------------------------------
-
-class DetectionVideoTrack(VideoStreamTrack):
-    def __init__(self):
-        super().__init__()
-        self.last_frame = None
-
-    async def recv(self):
-        pts, time_base = await self.next_timestamp()
-
-        try:
-            frame, ts = result_queue.get(timeout=0.02)
-            self.last_frame = frame
-        except queue.Empty:
-            if self.last_frame is None:
-                black = np.zeros((480,640,3), dtype=np.uint8)
-                frame = black
-            else:
-                frame = self.last_frame
-
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        avf = VideoFrame.from_ndarray(rgb, format="rgb24")
-        avf.pts = pts
-        avf.time_base = time_base
-        return avf
 
 
-# ---------------------------------------------------------
-#  WHIP STREAMER
-# ---------------------------------------------------------
-
-async def whip_stream():
-    pc = RTCPeerConnection()
-    track = DetectionVideoTrack()
-
-    codecs = get_capabilities("video").codecs
-    h264 = [c for c in codecs if c.mimeType == "video/H264"]
-
-    tx = pc.addTransceiver(track, direction="sendonly")
-    tx.setCodecPreferences(h264)
-
-    offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
-
-    async with ClientSession() as s:
-        async with s.post(
-            WHIP_ENDPOINT_URL,
-            headers={"Content-Type": "application/sdp"},
-            data=offer.sdp
-        ) as resp:
-            answer_sdp = await resp.text()
-            answer = RTCSessionDescription(sdp=answer_sdp, type="answer")
-            await pc.setRemoteDescription(answer)
-            print("[WHIP] Streaming started.")
-
-            while True:
-                await asyncio.sleep(0.5)
 
 
-# ---------------------------------------------------------
-#  MAIN
-# ---------------------------------------------------------
+# =========================================================
+# STREAM MANAGER
+# =========================================================
 
 async def main():
-    # Start capture
-    cap_thread = Thread(target=capture_loop, daemon=True)
-    cap_thread.start()
+    pipelines = {}
 
-    # Start workers
-    workers = []
-    for i in range(NUM_WORKERS):
-        w = TorchOBBWorker(i, MODEL_PATH, CUSTOM_CLASSES)
-        w.start()
-        workers.append(w)
+    print("[System] Multi-stream parallel inference started")
 
-    # Start WHIP
-    await whip_stream()
+    while True:
+        active_paths = set(get_active_paths())
 
+        # Start new pipelines
+        for name in active_paths - pipelines.keys():
+            pipelines[name] = StreamPipeline(name)
+
+        # Stop removed pipelines
+        for name in list(pipelines.keys()):
+            if name not in active_paths:
+                print(f"[Pipeline] Stopping {name}")
+                pipelines[name].running = False
+                del pipelines[name]
+
+        await asyncio.sleep(STREAM_SCAN_INTERVAL)
+
+
+# =========================================================
+# ENTRY
+# =========================================================
 
 if __name__ == "__main__":
     asyncio.run(main())
