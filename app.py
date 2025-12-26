@@ -28,7 +28,7 @@ RTSP_BASE   = "rtsp://0.0.0.0:8554"
 WHIP_BASE   = "https://droneuse.com:8889"
 
 MODEL_PATH = "OCT_1_PER_VE_OBB.pt"
-CONF_THRESHOLD = 0.4
+CONF_THRESHOLD = 0.55
 STREAM_SCAN_INTERVAL = 2.0
 
 
