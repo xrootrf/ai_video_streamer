@@ -1,3 +1,33 @@
+# version: "3.9"
+
+# services:
+#   drone-ai:
+#     container_name: drone-ai
+#     build: .
+#     image: drone-ai-rtx
+
+#     # Needed for RTSP + WHIP
+#     network_mode: host
+#     ipc: host
+
+#     # Auto-restart (important for drones)
+#     restart: unless-stopped
+
+#     # GPU access (RTX 4070)
+#     deploy:
+#       resources:
+#         reservations:
+#           devices:
+#             - driver: nvidia
+#               count: all
+#               capabilities: [gpu]
+
+#     # Optional but recommended
+#     environment:
+#       - NVIDIA_VISIBLE_DEVICES=all
+#       - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+
+
 version: "3.9"
 
 services:
@@ -10,7 +40,6 @@ services:
     network_mode: host
     ipc: host
 
-    # Auto-restart (important for drones)
     restart: unless-stopped
 
     # GPU access (RTX 4070)
@@ -22,7 +51,20 @@ services:
               count: all
               capabilities: [gpu]
 
-    # Optional but recommended
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+
+    # 🔽 ADD VOLUMES HERE
+    volumes:
+      # App source (hot reload / debugging)
+      - ./app.py:/app/app.py
+
+      # Models (persistent, editable)
+      - ./OCT_1_PER_VE_OBB.pt:/app/OCT_1_PER_VE_OBB.pt
+
+      # Logs / output videos / snapshots
+      - ./data:/app/data
+
+      # Optional configs
+      - ./config:/app/config
